@@ -31,5 +31,3 @@ Auth:
 
 
     # One seed URL per line. Lines starting with # are ignored.
-# https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/edit
-# https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/edit
