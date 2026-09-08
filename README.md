@@ -1,4 +1,4 @@
-LinkRunner (Python rewrite, expanded coverage)
+LinkRunner
 ================================================
 
 Enumerates everything reachable by crawling outward from "anyone with the
