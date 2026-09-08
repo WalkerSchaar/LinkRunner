@@ -28,3 +28,8 @@ Auth:
     First run opens a browser for Google OAuth consent (installed-app
     flow) using credentials.json in the working directory, or drops in a
     service_account.json if present. See README.md.
+
+
+    # One seed URL per line. Lines starting with # are ignored.
+# https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/edit
+# https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/edit
