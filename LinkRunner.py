@@ -1,4 +1,37 @@
 #!/usr/bin/env python3
+"""
+LinkRunner (Python rewrite, expanded coverage)
+================================================
+
+Enumerates everything reachable by crawling outward from "anyone with the
+link" Google Drive seed(s):
+
+  - Docs/Sheets/Slides/Forms content is exported and scanned for further
+    Drive links.
+  - Folders (including Shared Drive roots) are listed and their children
+    are queued, recursively.
+  - PDFs and Office files (docx/xlsx/pptx) are downloaded and scanned for
+    embedded links (PDF text + link annotations; OOXML zip internals).
+  - Anything discovered that ISN'T a crawlable Drive object -- other
+    Google products (Sites, Colab, Forms responses, Jamboard, Maps,
+    Groups, Calendar) or fully external URLs -- is logged to a separate
+    "external resources" CSV as a boundary/finding, since the tool has
+    no API access to crawl into those.
+
+Intended for AUTHORIZED security assessments / internal Drive-hygiene
+audits only. You need to already possess (or otherwise be authorized to
+use) every seed link -- this tool does not bypass any access control, it
+only follows references between resources that are already reachable.
+
+Usage:
+    python linkrunner.py crawl seeds.txt -o results.csv
+    python linkrunner.py crawl seeds.txt -o results.csv --max-depth 5 --domain example.com
+
+Auth:
+    First run opens a browser for Google OAuth consent (installed-app
+    flow) using credentials.json in the working directory, or drops in a
+    service_account.json if present. See README.md.
+"""
 
 import argparse
 import csv
@@ -25,7 +58,22 @@ try:
 except ImportError:
     PdfReader = None
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+try:
+    from PIL import Image
+    from PIL.ExifTags import TAGS
+except ImportError:
+    Image = None
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+]
 
 TOKEN_PATH = "token.json"
 CREDS_PATH = "credentials.json"
@@ -100,8 +148,8 @@ LOGIN_REDIRECT_MARKERS = [
 EXPORTABLE_MIME_TYPES = {
     "application/vnd.google-apps.document": "text/plain",
     "application/vnd.google-apps.presentation": "text/plain",
-    # CSV export only covers the first sheet -- fine for link-discovery.
-    "application/vnd.google-apps.spreadsheet": "text/csv",
+    # Sheets are handled separately via the Sheets API (fetch_sheet_all_tabs_text)
+    # for full multi-tab hyperlink coverage, not this simple export endpoint.
 }
 
 OOXML_ZIP_MIME_TYPES = {
@@ -110,6 +158,29 @@ OOXML_ZIP_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
+# Legacy OLE-binary Office formats. No lightweight pure-Python parser
+# extracts hyperlinks from these reliably, so we fall back to a
+# strings(1)-style heuristic: pull printable ASCII and UTF-16LE runs out
+# of the raw bytes and regex-scan those. Good enough for link discovery.
+LEGACY_OFFICE_MIME_TYPES = {
+    "application/msword",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+}
+
+PLAIN_TEXT_MIME_TYPES = {
+    "text/plain",
+    "application/rtf",
+    "text/rtf",
+}
+
+# Gated behind --scan-images since it's the heaviest/slowest scan (EXIF
+# read via Pillow + QR decode via OpenCV) and least often fruitful.
+IMAGE_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/tiff", "image/bmp", "image/webp",
+}
+
+SHEETS_NATIVE_MIME = "application/vnd.google-apps.spreadsheet"
 PDF_MIME = "application/pdf"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
@@ -130,6 +201,8 @@ class CrawlState:
     crawled_ids: set = field(default_factory=set)
     queued_ids: set = field(default_factory=set)
     logged_external: set = field(default_factory=set)
+    main_rows: list = field(default_factory=list)   # kept in memory for optional graph export
+    ext_rows: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +352,103 @@ def extract_from_pdf(data: bytes) -> str:
     return "\n".join(chunks)
 
 
+def extract_strings_heuristic(data: bytes, min_len: int = 6) -> str:
+    """strings(1)-style extraction for formats with no lightweight parser
+    (legacy .doc/.xls/.ppt). Pulls printable-ASCII runs and UTF-16LE runs
+    out of the raw bytes; hyperlink targets in these binary formats are
+    almost always stored as literal readable text somewhere in the file,
+    so this catches them without needing a full OLE/CFB parser."""
+    ascii_run_re = re.compile(rb"[\x20-\x7e]{%d,}" % min_len)
+    chunks = [m.group().decode("ascii", errors="ignore") for m in ascii_run_re.finditer(data)]
+
+    # UTF-16LE text (common in Word 97-2003 streams): printable ASCII byte
+    # followed by a null byte, repeated.
+    utf16_run_re = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % min_len)
+    for m in utf16_run_re.finditer(data):
+        try:
+            chunks.append(m.group().decode("utf-16-le", errors="ignore"))
+        except Exception:
+            continue
+    return "\n".join(chunks)
+
+
+def extract_from_text_bytes(data: bytes) -> str:
+    """.txt and .rtf are already plain text (RTF's HYPERLINK field syntax
+    keeps the literal URL as readable ASCII), so just decode."""
+    return data.decode("utf-8", errors="ignore")
+
+
+def extract_from_image(data: bytes) -> str:
+    """Pull URLs out of EXIF text fields (UserComment/ImageDescription/
+    Artist/Copyright, etc. occasionally carry a link) and out of any QR
+    codes rendered in the image itself."""
+    chunks = []
+
+    if Image is not None:
+        try:
+            img = Image.open(io.BytesIO(data))
+            exif = img.getexif()
+            for tag_id, value in exif.items():
+                tag = TAGS.get(tag_id, tag_id)
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="ignore")
+                if isinstance(value, str):
+                    chunks.append(f"{tag}: {value}")
+        except Exception as e:
+            print(f"[WARN] Could not read EXIF: {e}")
+    else:
+        print("[WARN] Pillow not installed -- skipping EXIF read")
+
+    if cv2 is not None:
+        try:
+            arr = np.frombuffer(data, dtype=np.uint8)
+            cv_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if cv_img is not None:
+                detector = cv2.QRCodeDetector()
+                ok, decoded_texts, _, _ = detector.detectAndDecodeMulti(cv_img)
+                if ok:
+                    chunks.extend(t for t in decoded_texts if t)
+        except Exception as e:
+            print(f"[WARN] Could not run QR detection: {e}")
+    else:
+        print("[WARN] opencv-python not installed -- skipping QR code scan")
+
+    return "\n".join(chunks)
+
+
+def fetch_sheet_all_tabs_text(sheets_service, spreadsheet_id):
+    """Full multi-tab walk via the Sheets API: pulls every cell's
+    hyperlink (explicit link, not just visible text) and formatted value
+    across every sheet/tab, not just the first one CSV export would give."""
+    try:
+        resp = with_backoff(
+            lambda: sheets_service.spreadsheets().get(
+                spreadsheetId=spreadsheet_id,
+                includeGridData=True,
+                fields="sheets(properties(title),"
+                       "data(rowData(values(hyperlink,formattedValue,"
+                       "userEnteredValue(formulaValue)))))",
+            ).execute()
+        )
+    except HttpError as e:
+        print(f"[WARN] Could not read spreadsheet {spreadsheet_id} via Sheets API: {e}")
+        return ""
+
+    chunks = []
+    for sheet in resp.get("sheets", []):
+        for grid in sheet.get("data", []):
+            for row in grid.get("rowData", []):
+                for cell in row.get("values", []):
+                    if cell.get("hyperlink"):
+                        chunks.append(cell["hyperlink"])
+                    if cell.get("formattedValue"):
+                        chunks.append(cell["formattedValue"])
+                    formula = cell.get("userEnteredValue", {}).get("formulaValue")
+                    if formula:
+                        chunks.append(formula)
+    return "\n".join(chunks)
+
+
 # ---------------------------------------------------------------------------
 # Drive API calls (with backoff)
 # ---------------------------------------------------------------------------
@@ -365,6 +535,57 @@ def list_folder_children(drive_service, folder_id):
 
 
 # ---------------------------------------------------------------------------
+# Optional: graph export
+# ---------------------------------------------------------------------------
+
+def export_graph(main_rows, ext_rows, output_path):
+    """Build a directed graph from the crawl (Drive objects + external
+    resources as nodes, discovery relationships as edges) and export it
+    for visualization/analysis with networkx / Gephi / etc."""
+    try:
+        import networkx as nx
+    except ImportError:
+        print("[WARN] networkx not installed -- skipping graph export (pip install networkx)")
+        return
+
+    g = nx.DiGraph()
+    for row in main_rows:
+        g.add_node(
+            row["file_id"], label=row.get("name", ""), node_type="drive_file",
+            mime_type=row.get("mime_type", ""), depth=row.get("depth", ""),
+            permission_types=row.get("permission_types", ""),
+        )
+        if row.get("discovered_from"):
+            g.add_edge(row["discovered_from"], row["file_id"],
+                       method=row.get("discovery_method", ""))
+
+    for row in ext_rows:
+        g.add_node(
+            row["url"], label=row["url"], node_type="external",
+            category=row.get("category", ""), reachable=row.get("reachable", ""),
+        )
+        if row.get("discovered_from_file_id"):
+            g.add_edge(row["discovered_from_file_id"], row["url"], method="external_link")
+
+    ext = os.path.splitext(output_path)[1].lower()
+    try:
+        if ext == ".gexf":
+            nx.write_gexf(g, output_path)
+        elif ext == ".dot":
+            nx.drawing.nx_pydot.write_dot(g, output_path)
+        else:
+            if ext != ".graphml":
+                output_path += ".graphml"
+            nx.write_graphml(g, output_path)
+    except Exception as e:
+        print(f"[WARN] Could not write graph: {e}")
+        return
+
+    print(f"[NOTICE] Graph exported to {output_path} "
+          f"({g.number_of_nodes()} nodes, {g.number_of_edges()} edges)")
+
+
+# ---------------------------------------------------------------------------
 # Persistence helpers
 # ---------------------------------------------------------------------------
 
@@ -398,9 +619,11 @@ def domain_allowed(email_or_domain, domain_filter):
 
 def crawl(seed_path, output_csv, external_csv, max_depth=6, domain_filter=None,
           delay=0.5, resume_path=None, scan_binaries=True,
-          include_all_external=False, check_reachable=False):
+          include_all_external=False, check_reachable=False,
+          scan_images=False, graph_output=None):
     creds = load_credentials()
     drive_service = build("drive", "v3", credentials=creds)
+    sheets_service = build("sheets", "v4", credentials=creds)
 
     seeds = load_seeds(seed_path)
     if not seeds:
@@ -444,16 +667,20 @@ def crawl(seed_path, output_csv, external_csv, max_depth=6, domain_filter=None,
                 continue
             state.logged_external.add(key)
             reachable = check_reachability(url) if check_reachable else "not_checked"
-            ext_writer.writerow({
+            ext_row = {
                 "url": url, "category": category, "reachable": reachable,
                 "discovered_from_file_id": discovered_from or "",
                 "depth": depth, "seed_source": seed_source,
-            })
+            }
+            ext_writer.writerow(ext_row)
+            state.ext_rows.append(ext_row)
             external_count += 1
         if links:
             ext_file.flush()
 
-    try:
+    def drain_queue():
+        """Process everything currently queued -- the BFS/expansion loop."""
+        nonlocal found_count
         while state.to_crawl:
             file_id, depth, discovered_from, seed_source, discovery_method = state.to_crawl.popleft()
             state.queued_ids.discard(file_id)
@@ -475,6 +702,7 @@ def crawl(seed_path, output_csv, external_csv, max_depth=6, domain_filter=None,
                 row["error"] = f"HTTP {e.resp.status}"
                 main_writer.writerow(row)
                 main_file.flush()
+                state.main_rows.append(row)
                 print(f"[STATUS] {file_id}: error ({row['error']}), "
                       f"queue={len(state.to_crawl)} crawled={len(state.crawled_ids)}")
                 continue
@@ -493,6 +721,7 @@ def crawl(seed_path, output_csv, external_csv, max_depth=6, domain_filter=None,
             })
             main_writer.writerow(row)
             main_file.flush()
+            state.main_rows.append(row)
             found_count += 1
 
             print(f"[STATUS] [{discovery_method}] '{row['name']}' ({file_id}) "
@@ -516,6 +745,8 @@ def crawl(seed_path, output_csv, external_csv, max_depth=6, domain_filter=None,
                     if cid not in state.crawled_ids and cid not in state.queued_ids:
                         state.to_crawl.append((cid, depth + 1, file_id, seed_source, "folder_listing"))
                         state.queued_ids.add(cid)
+            elif mime_type == SHEETS_NATIVE_MIME:
+                text_to_scan = fetch_sheet_all_tabs_text(sheets_service, file_id)
             elif mime_type in EXPORTABLE_MIME_TYPES:
                 text_to_scan = fetch_exported_text(drive_service, file_id, mime_type)
             elif scan_binaries and mime_type == PDF_MIME:
@@ -526,12 +757,37 @@ def crawl(seed_path, output_csv, external_csv, max_depth=6, domain_filter=None,
                 data = fetch_raw_bytes(drive_service, file_id, row["size"])
                 if data:
                     text_to_scan = extract_from_ooxml_zip(data)
+            elif scan_binaries and mime_type in LEGACY_OFFICE_MIME_TYPES:
+                data = fetch_raw_bytes(drive_service, file_id, row["size"])
+                if data:
+                    text_to_scan = extract_strings_heuristic(data)
+            elif scan_binaries and mime_type in PLAIN_TEXT_MIME_TYPES:
+                data = fetch_raw_bytes(drive_service, file_id, row["size"])
+                if data:
+                    text_to_scan = extract_from_text_bytes(data)
+            elif scan_images and mime_type in IMAGE_MIME_TYPES:
+                data = fetch_raw_bytes(drive_service, file_id, row["size"])
+                if data:
+                    text_to_scan = extract_from_image(data)
 
             if text_to_scan:
                 new_ids = extract_file_ids(text_to_scan) - state.crawled_ids - state.queued_ids
+                method_by_mime = {
+                    SHEETS_NATIVE_MIME: "sheet_link", PDF_MIME: "pdf_text",
+                }
                 for new_id in new_ids:
-                    method = "pdf_text" if mime_type == PDF_MIME else (
-                        "office_text" if mime_type in OOXML_ZIP_MIME_TYPES else "doc_link")
+                    if mime_type in method_by_mime:
+                        method = method_by_mime[mime_type]
+                    elif mime_type in OOXML_ZIP_MIME_TYPES:
+                        method = "office_text"
+                    elif mime_type in LEGACY_OFFICE_MIME_TYPES:
+                        method = "legacy_office_text"
+                    elif mime_type in PLAIN_TEXT_MIME_TYPES:
+                        method = "text_file"
+                    elif mime_type in IMAGE_MIME_TYPES:
+                        method = "image_scan"
+                    else:
+                        method = "doc_link"
                     state.to_crawl.append((new_id, depth + 1, file_id, seed_source, method))
                     state.queued_ids.add(new_id)
 
@@ -541,6 +797,8 @@ def crawl(seed_path, output_csv, external_csv, max_depth=6, domain_filter=None,
             save_resume_state(resume_path, state.crawled_ids)
             time.sleep(delay + random.uniform(0, 0.3))
 
+    try:
+        drain_queue()
     except KeyboardInterrupt:
         print("\n[NOTICE] Interrupted -- progress saved, re-run to resume.")
     finally:
@@ -549,6 +807,9 @@ def crawl(seed_path, output_csv, external_csv, max_depth=6, domain_filter=None,
 
     print(f"[SUCCESS] Crawl finished. {found_count} Drive object(s) -> {output_csv}, "
           f"{external_count} external resource(s) -> {external_csv}.")
+
+    if graph_output:
+        export_graph(state.main_rows, state.ext_rows, graph_output)
 
 
 def main():
@@ -574,6 +835,13 @@ def main():
                           help="Make an unauthenticated request to each logged external/"
                                "google_other/cloud_storage link to check if it's actually "
                                "publicly accessible or bounces to a login page (requires 'requests')")
+    crawl_p.add_argument("--scan-images", action="store_true",
+                          help="Also download images and scan EXIF fields + QR codes for links "
+                               "(requires Pillow + opencv-python; slower, opt-in)")
+    crawl_p.add_argument("--graph-output", default=None,
+                          help="Export the discovery graph to this path (.graphml, .gexf, or .dot; "
+                               "requires networkx). Nodes = Drive objects + external resources, "
+                               "edges = how each was discovered.")
 
     args = parser.parse_args()
 
@@ -593,6 +861,8 @@ def main():
             scan_binaries=not args.no_binary_scan,
             include_all_external=args.include_all_external,
             check_reachable=args.check_reachability,
+            scan_images=args.scan_images,
+            graph_output=args.graph_output,
         )
 
 
