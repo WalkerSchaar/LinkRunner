@@ -4,3 +4,10 @@ google-auth-oauthlib>=1.1.0
 pypdf>=5.0.0
 requests>=2.31.0
  
+# Optional: enables --scan-images (EXIF fields + QR code decoding)
+Pillow>=10.0.0
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+ 
+# Optional: enables --graph-output
+networkx>=3.2.0
