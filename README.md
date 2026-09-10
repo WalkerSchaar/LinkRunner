@@ -60,8 +60,18 @@ caches the resulting token:
 python3 linkrunner.py <seed> --oauth-client-secret /path/to/client_secret.json
 ```
 
+If a file named exactly `client_secret.json` sits in the current directory
+or next to `linkrunner.py`, it's auto-detected — you can drop the
+`--oauth-client-secret` flag entirely:
+
+```bash
+python3 linkrunner.py <seed>
+```
+
 Subsequent runs reuse the cached token (`--oauth-token`, default
-`.linkrunner_oauth_token.json`) and refresh it automatically.
+`.linkrunner_oauth_token.json`) and refresh it automatically — once that
+token exists, you don't need `--oauth-client-secret` (or an auto-detected
+`client_secret.json`) at all, even on the very next run.
 
 The API scope used is read-only: `drive.readonly`.
 
@@ -89,7 +99,7 @@ python3 linkrunner.py <seed> --service-account sa.json \
 |---|---|
 | `seeds` | Seed Drive file/folder IDs or share links (omit if `--resume`) |
 | `--service-account PATH` | Service account JSON key |
-| `--oauth-client-secret PATH` | OAuth client secret for interactive login |
+| `--oauth-client-secret PATH` | OAuth client secret for interactive login (auto-detected if `client_secret.json` is in the current directory or next to the script) |
 | `--oauth-token PATH` | Cached OAuth token location |
 | `--state-file PATH` | Hidden state file (default `.linkrunner_state.json`) |
 | `--resume` | Resume from the existing state file |
