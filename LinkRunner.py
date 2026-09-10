@@ -21,11 +21,12 @@ try:
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
+    import requests
 except ImportError:
     print(
         "Missing dependencies. Install with:\n"
         "  pip install --break-system-packages google-api-python-client "
-        "google-auth-httplib2 google-auth-oauthlib",
+        "google-auth-httplib2 google-auth-oauthlib requests",
         file=sys.stderr,
     )
     raise
@@ -283,6 +284,35 @@ class LinkRunner:
                     allow_discovery = True
         return is_public, best_role, allow_discovery
 
+    @staticmethod
+    def probe_anonymous_access(web_view_link: str) -> bool:
+        """Independent, unauthenticated check for whether a resource is truly
+        reachable by anyone.
+
+        The Drive API only returns the full permissions list (including the
+        `type: anyone` entry) to accounts that own the file or have edit /
+        organizer access. A viewer-only account — even one that's only able
+        to view the file *because* it's shared with anyone — often gets a
+        permissions list back that omits that entry entirely. This probe
+        makes a plain HTTP request with no auth token at all and checks
+        whether it resolves without being redirected to a Google login page,
+        which is a direct test of public reachability that doesn't depend on
+        what the API is willing to tell the authenticated caller.
+        """
+        if not web_view_link:
+            return False
+        try:
+            resp = requests.get(
+                web_view_link, allow_redirects=True, timeout=10,
+                headers={"User-Agent": "Mozilla/5.0 (LinkRunner audit probe)"},
+            )
+            final_url = resp.url or ""
+            if "accounts.google.com" in final_url or "ServiceLogin" in final_url:
+                return False
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
     # -- Link mining ---------------------------------------------------
 
     def mine_links(self, file_id: str, mime_type: str) -> list:
@@ -296,7 +326,9 @@ class LinkRunner:
             elif mime_type.startswith(PLAIN_TEXT_MIME_PREFIXES) or mime_type in PLAIN_TEXT_MIME_EXACT:
                 text = self.download_text(file_id)
         except HttpError as e:
-            log.debug("Could not read content of %s (%s): %s", file_id, mime_type, e)
+            log.warning("Could not read content of %s (%s) — link mining skipped for this file: %s",
+                        file_id, mime_type, e)
+            self.state.stats["errors"] += 1
             return []
         if not text:
             return []
@@ -362,6 +394,17 @@ class LinkRunner:
             return
 
         is_public, best_role, allow_discovery = self.analyze_permissions(meta)
+        detection_method = "api" if is_public else None
+
+        # The Drive API under-reports the 'anyone' permission to viewer-only
+        # accounts (see probe_anonymous_access docstring). If the API-visible
+        # permissions didn't show a public grant, independently verify with
+        # an unauthenticated request before concluding the resource is private.
+        if not is_public and mime_type not in (FOLDER_MIME, SHORTCUT_MIME):
+            if self.probe_anonymous_access(meta.get("webViewLink", "")):
+                is_public = True
+                detection_method = "probe"
+
         owners = ", ".join(o.get("emailAddress", "") for o in meta.get("owners", []) or [])
 
         if is_public:
@@ -372,8 +415,9 @@ class LinkRunner:
                 "mime_type": mime_type,
                 "web_view_link": meta.get("webViewLink", ""),
                 "owner_emails": owners,
-                "permission_role": best_role or "",
+                "permission_role": best_role or ("unknown (probe-detected)" if detection_method == "probe" else ""),
                 "allow_file_discovery": allow_discovery,
+                "detection_method": detection_method,
                 "depth": depth,
                 "discovered_at": datetime.now(timezone.utc).isoformat(),
             })
@@ -406,10 +450,35 @@ class LinkRunner:
 # Reporting
 # --------------------------------------------------------------------------
 
+def _resolve_writable_path(out_path: str) -> str:
+    """If out_path is locked by another process (common on Windows when the
+    file is open in Excel or an editor), fall back to a numbered filename
+    instead of crashing and losing the crawl results."""
+    if not os.path.exists(out_path):
+        return out_path
+    try:
+        with open(out_path, "a"):
+            pass
+        return out_path
+    except PermissionError:
+        base, ext = os.path.splitext(out_path)
+        for i in range(1, 100):
+            candidate = f"{base}_{i}{ext}"
+            if not os.path.exists(candidate):
+                log.warning(
+                    "%s is locked by another program (probably open in Excel/an editor) — "
+                    "writing to %s instead. Close %s and re-run to overwrite it directly next time.",
+                    out_path, candidate, out_path,
+                )
+                return candidate
+        return out_path  # give up falling back after 99 attempts; let the caller raise
+
+
 def write_csv_report(state: CrawlState, out_path: str):
+    out_path = _resolve_writable_path(out_path)
     fieldnames = [
         "file_id", "name", "mime_type", "web_view_link", "owner_emails",
-        "permission_role", "allow_file_discovery", "depth", "discovered_at",
+        "permission_role", "allow_file_discovery", "detection_method", "depth", "discovered_at",
     ]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -418,102 +487,6 @@ def write_csv_report(state: CrawlState, out_path: str):
             writer.writerow(row)
     log.info("CSV report written to %s (%d public resources)", out_path, len(state.findings))
 
-
-def write_html_graph(state: CrawlState, out_path: str):
-    """Render an interactive vis-network graph of the crawl: nodes are Drive
-    files/folders/external URLs, edges are containment/shortcut/link
-    relationships. Public resources are highlighted."""
-    nodes = []
-    node_ids_seen = set()
-    for nid, meta in state.nodes.items():
-        color = "#5b8def"
-        shape = "dot"
-        if meta.get("type") == "folder":
-            color = "#f2c14e"
-            shape = "box"
-        elif meta.get("type") == "external":
-            color = "#9e9e9e"
-            shape = "diamond"
-        if meta.get("public"):
-            color = "#e5484d"  # red = publicly exposed
-        label = meta.get("name", nid)
-        if len(label) > 40:
-            label = label[:37] + "..."
-        nodes.append({
-            "id": nid,
-            "label": label,
-            "color": color,
-            "shape": shape,
-            "title": json.dumps(meta, indent=2)[:500],
-        })
-        node_ids_seen.add(nid)
-
-    edges = []
-    edge_colors = {"contains": "#888888", "shortcut": "#b46fd1", "google_link": "#5b8def", "external_link": "#cccccc"}
-    for src, dst, kind in state.edges:
-        if src not in node_ids_seen or dst not in node_ids_seen:
-            continue
-        edges.append({
-            "from": src, "to": dst,
-            "color": edge_colors.get(kind, "#aaaaaa"),
-            "title": kind,
-            "dashes": kind in ("external_link", "google_link"),
-        })
-
-    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)) \
-                         .replace("__EDGES__", json.dumps(edges)) \
-                         .replace("__STATS__", json.dumps(state.stats, indent=2)) \
-                         .replace("__GENERATED__", datetime.now(timezone.utc).isoformat())
-    with open(out_path, "w") as f:
-        f.write(html)
-    log.info("HTML graph written to %s", out_path)
-
-
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>LinkRunner Crawl Graph</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.6/vis-network.min.js"></script>
-<style>
-  html, body { margin:0; height:100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0f1117; color:#e6e6e6; }
-  #header { padding:12px 20px; border-bottom:1px solid #2a2d38; display:flex; justify-content:space-between; align-items:center; }
-  #header h1 { font-size:16px; margin:0; }
-  #legend { font-size:12px; color:#aaa; }
-  #legend span { margin-left:14px; }
-  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; vertical-align:middle; }
-  #network { width:100%; height:calc(100% - 52px); }
-  #stats { position:absolute; top:60px; right:20px; background:#181b24; border:1px solid #2a2d38; border-radius:8px; padding:10px 14px; font-size:12px; white-space:pre; }
-</style>
-</head>
-<body>
-<div id="header">
-  <h1>LinkRunner &mdash; Drive Exposure Graph <span style="color:#777;font-weight:normal;">generated __GENERATED__</span></h1>
-  <div id="legend">
-    <span><i class="dot" style="background:#e5484d"></i>Publicly exposed</span>
-    <span><i class="dot" style="background:#f2c14e"></i>Folder</span>
-    <span><i class="dot" style="background:#5b8def"></i>File</span>
-    <span><i class="dot" style="background:#9e9e9e"></i>External link</span>
-  </div>
-</div>
-<div id="network"></div>
-<div id="stats">__STATS__</div>
-<script>
-  const nodes = new vis.DataSet(__NODES__);
-  const edges = new vis.DataSet(__EDGES__);
-  const container = document.getElementById('network');
-  const data = { nodes, edges };
-  const options = {
-    nodes: { font: { color: '#e6e6e6', size: 13 }, borderWidth: 1 },
-    edges: { arrows: 'to', smooth: { type: 'dynamic' } },
-    physics: { stabilization: true, barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
-    interaction: { hover: true, tooltipDelay: 100 }
-  };
-  new vis.Network(container, data, options);
-</script>
-</body>
-</html>
-"""
 
 
 # --------------------------------------------------------------------------
@@ -527,7 +500,10 @@ def main():
     )
     parser.add_argument("seeds", nargs="*", help="Seed Drive file/folder IDs or share links")
     parser.add_argument("--service-account", help="Path to a service account JSON key")
-    parser.add_argument("--oauth-client-secret", help="Path to an OAuth client_secret.json for interactive login")
+    parser.add_argument("--oauth-client-secret",
+                         help="Path to an OAuth client_secret.json for interactive login "
+                              "(auto-detected if a file named client_secret.json sits next to "
+                              "this script or in the current directory)")
     parser.add_argument("--oauth-token", default=".linkrunner_oauth_token.json",
                          help="Where to cache/read OAuth user credentials")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Hidden state file for resume support")
@@ -555,6 +531,14 @@ def main():
                 continue
             state.queue.append((seed_id, 0))
 
+    if not args.service_account and not args.oauth_client_secret:
+        for candidate in ("client_secret.json",
+                           os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_secret.json")):
+            if os.path.exists(candidate):
+                args.oauth_client_secret = candidate
+                log.info("Auto-detected OAuth client secret at %s", candidate)
+                break
+
     service = build_drive_service(args.service_account, args.oauth_token, args.oauth_client_secret)
     runner = LinkRunner(service, state, args.state_file, max_depth=args.max_depth,
                          request_delay=args.request_delay)
@@ -566,11 +550,10 @@ def main():
         state.save(args.state_file)
         sys.exit(1)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    csv_path = os.path.join(args.out_prefix, f"anon-link-audit-{timestamp}.csv")
-    html_path = os.path.join(args.out_prefix, f"linkrunner-graph-{timestamp}.html")
+    os.makedirs(args.out_prefix, exist_ok=True)
+
+    csv_path = os.path.join(args.out_prefix, "Links.csv")
     write_csv_report(state, csv_path)
-    write_html_graph(state, html_path)
 
 
 if __name__ == "__main__":
